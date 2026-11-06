@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -82,24 +83,98 @@ func virtualDesktopBounds() (x, y, width, height int32) {
 	return call(76), call(77), call(78), call(79)
 }
 
+// findFontsDir ищет папку fonts рядом с .scr, потом в текущей директории.
+func findFontsDir() string {
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), fontsDirName)
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	if info, err := os.Stat(fontsDirName); err == nil && info.IsDir() {
+		return fontsDirName
+	}
+	return ""
+}
+
+// loadFontsFromDir читает все .ttf/.otf из папки и превращает в GoTextFaceSource.
+// Файлы .ttc (коллекции) пропускаются — Ebitengine их не поддерживает.
+func loadFontsFromDir(dir string) []*text.GoTextFaceSource {
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("fonts: не удалось прочитать %s: %v", dir, err)
+		return nil
+	}
+
+	var sources []*text.GoTextFaceSource
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		fullPath := filepath.Join(dir, e.Name())
+
+		if strings.HasSuffix(name, ".ttc") {
+			log.Printf("fonts: пропускаю %s (TTC не поддерживается, нужен TTF/OTF)", e.Name())
+			continue
+		}
+		if !strings.HasSuffix(name, ".ttf") && !strings.HasSuffix(name, ".otf") {
+			continue
+		}
+
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			log.Printf("fonts: не прочитан %s: %v", e.Name(), err)
+			continue
+		}
+		src, err := text.NewGoTextFaceSource(bytes.NewReader(data))
+		if err != nil {
+			log.Printf("fonts: не разобран %s: %v", e.Name(), err)
+			continue
+		}
+		sources = append(sources, src)
+		log.Printf("fonts: загружен %s", e.Name())
+	}
+	return sources
+}
+
 // ---------- Константы ----------
 
 const (
-	fontPath     = `C:\Windows\Fonts\consola.ttf`
-	rainFontSize = 12 // дождь снаружи маски
-	maskFontSize = 32 // дождь внутри маски (выпуклая линза)
-	cellW        = 10
-	cellH        = 17
-	textFontSize = 250 // только для растеризации маски
+	systemFontPath = `C:\Windows\Fonts\consola.ttf` // системный, для маски и fallback
+	fontsDirName   = "fonts"                        // папка с пользовательскими шрифтами
+	rainFontSize   = 12                             // дождь снаружи маски
+	maskFontSize   = 32                             // дождь внутри маски (выпуклая линза)
+	cellW          = 10
+	cellH          = 17
+	textFontSize   = 250 // только для растеризации маски
 )
 
 // ---------- Символы ----------
 
 var matrixChars = func() []string {
-	s := "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	result := make([]string, 0, len(s))
-	for _, r := range s {
-		result = append(result, string(r))
+	parts := []string{
+		// Японская катакана (46)
+		"アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン",
+		// Латиница (52)
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+		// Цифры (10)
+		"0123456789",
+		// Кириллица (66)
+		"АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+		// Греческий (48)
+		"ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω",
+		// Спецсимволы (26)
+		"!@#$%&*()?/~",
+	}
+	var result []string
+	for _, p := range parts {
+		for _, r := range p {
+			result = append(result, string(r))
+		}
 	}
 	return result
 }()
@@ -164,7 +239,7 @@ func (c *Column) Update(screenHeight int) {
 	}
 }
 
-func (c *Column) Draw(screen *ebiten.Image, rainFace, maskFace *text.GoTextFace, mask [][]bool) {
+func (c *Column) Draw(screen *ebiten.Image, rainFace, maskFace text.Face, mask [][]bool) {
 	cellsY := len(mask)
 	if cellsY == 0 {
 		return
@@ -182,7 +257,7 @@ func (c *Column) Draw(screen *ebiten.Image, rainFace, maskFace *text.GoTextFace,
 		cy := int(y+float64(rainFontSize)/2.0) / cellH
 		insideMask := cx >= 0 && cx < cellsX && cy >= 0 && cy < cellsY && mask[cy][cx]
 
-		var face *text.GoTextFace
+		var face text.Face
 		var clr color.RGBA
 		var offset float64
 
@@ -215,8 +290,8 @@ func (c *Column) Draw(screen *ebiten.Image, rainFace, maskFace *text.GoTextFace,
 // ---------- Game ----------
 
 type Game struct {
-	rainFace         *text.GoTextFace
-	maskFace         *text.GoTextFace
+	rainFace         text.Face
+	maskFace         text.Face
 	monitors         []Monitor
 	columns          []*Column
 	mask             [][]bool
@@ -229,20 +304,50 @@ type Game struct {
 }
 
 func NewGame(monitors []Monitor, screenW, screenH int) (*Game, error) {
-	fontData, err := os.ReadFile(fontPath)
+	// 1. Системный шрифт — всегда нужен для маски и как fallback для латиницы.
+	systemData, err := os.ReadFile(systemFontPath)
 	if err != nil {
-		return nil, fmt.Errorf("шрифт: %w", err)
+		return nil, fmt.Errorf("системный шрифт: %w", err)
 	}
-	src, err := text.NewGoTextFaceSource(bytes.NewReader(fontData))
+	systemSrc, err := text.NewGoTextFaceSource(bytes.NewReader(systemData))
 	if err != nil {
-		return nil, fmt.Errorf("разбор шрифта: %w", err)
+		return nil, fmt.Errorf("разбор системного шрифта: %w", err)
 	}
 
-	mask, err := buildMask(monitors, screenW, screenH, fontData)
+	// 2. Пользовательские шрифты из папки fonts/.
+	fontsDir := findFontsDir()
+	userSrcs := loadFontsFromDir(fontsDir)
+	if len(userSrcs) == 0 {
+		log.Printf("fonts: пусто или папка не найдена (%q), использую только системный", fontsDir)
+	} else {
+		log.Printf("fonts: загружено %d шрифтов из %s", len(userSrcs), fontsDir)
+	}
+
+	// 3. Собираем цепочку: сначала пользовательские, потом системный как fallback.
+	buildChain := func(size float64) text.Face {
+		faces := make([]text.Face, 0, len(userSrcs)+1)
+		for _, s := range userSrcs {
+			faces = append(faces, &text.GoTextFace{Source: s, Size: size})
+		}
+		faces = append(faces, &text.GoTextFace{Source: systemSrc, Size: size})
+		mf, err := text.NewMultiFace(faces...)
+		if err != nil {
+			log.Printf("MultiFace size=%.0f: %v, откат на системный", size, err)
+			return &text.GoTextFace{Source: systemSrc, Size: size}
+		}
+		return mf
+	}
+
+	rainFace := buildChain(rainFontSize)
+	maskFace := buildChain(maskFontSize)
+
+	// 4. Маска — всегда на системном шрифте (надпись латинская, должна быть стабильной).
+	mask, err := buildMask(monitors, screenW, screenH, systemData)
 	if err != nil {
 		return nil, fmt.Errorf("маска: %w", err)
 	}
 
+	// 5. Колонки.
 	numCols := screenW / cellW
 	columns := make([]*Column, numCols)
 	for i := 0; i < numCols; i++ {
@@ -250,8 +355,8 @@ func NewGame(monitors []Monitor, screenW, screenH int) (*Game, error) {
 	}
 
 	return &Game{
-		rainFace:  &text.GoTextFace{Source: src, Size: rainFontSize},
-		maskFace:  &text.GoTextFace{Source: src, Size: maskFontSize},
+		rainFace:  rainFace,
+		maskFace:  maskFace,
 		monitors:  monitors,
 		columns:   columns,
 		mask:      mask,
